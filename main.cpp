@@ -9,6 +9,21 @@
 #include <fmt/format.h>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <map>
+#include <assert.h>
+#include <stdio.h>
+
+void debug_msg(const char* msg) {
+    return;
+    FILE* g_fp = nullptr;
+    std::string path = "/home/xdoo/workspace/httpserver_c17/report.log";
+    g_fp = fopen(path.c_str(), "a");
+    fprintf(g_fp, "%s", msg);
+    fprintf(g_fp, "-----------------\n");
+    if(g_fp) fclose(g_fp);
+}
+
 
 #if 0
 struct addrinfo
@@ -65,6 +80,9 @@ struct address_resolved_entry {
     }
     int create_socket() const {
         int socketfd = CHECK_CALL(socket, current->ai_family, current->ai_socktype, current->ai_protocol);
+        // 设置端口复用
+        int opt = 1;
+        setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         return socketfd;
     }
     bool next_entry() {
@@ -104,32 +122,133 @@ struct address_resolver {
     }
 };
 
-struct http_request_parser {
+using StringMap = std::map<std::string, std::string>;
+struct http11_header_parse {
     std::string head;
+    std::string heading_line;
+    StringMap head_keys;
     std::string body;
-    bool head_finish = false;
-    bool body_finish = false;
+    bool head_finished_ = false;
 
-    bool need_more_chunks() {
-        return !body_finish; // 正文结束了，不需要其他数据了
+    bool head_finished() {
+        return head_finished_;
+    }
+
+    void _extract_headers() {
+        size_t pos = head.find("\r\n");
+        while(pos != std::string::npos) {
+            // skip "\r\n"
+            pos += 2;
+            // 从当前位置开始找，先找到下一行位置（可能为npose）
+            size_t next_pos = head.find("\r\n", pos);
+            size_t line_len = std::string::npos;
+            if(next_pos != std::string::npos){
+                // 如果下一行还不是结束，那么line_len设为本行开始到下一行的距离
+                line_len = next_pos - pos;
+            }
+            // 切下本行
+            std::string_view line = std::string_view(head).substr(pos, line_len);
+            size_t colon = line.find(": ");
+            if(colon != std::string::npos) {
+                std::string key = std::string(line.substr(0, colon));
+                std::string_view value = line.substr(colon + 2);
+                // http不区分大小写，因此这里将键统一修改为小写
+                std::transform(key.begin(), key.end(), key.begin(), [](char c){
+                    if('A' <= c && c <= 'Z')
+                        c += 'a' - 'A';
+                    return c;
+                });
+                // c++17更高效的写法 等效于head_keys[key] = value 
+                head_keys.insert_or_assign(std::move(key), value);
+            }
+            pos = next_pos;
+        }
     }
 
     void push_chunk(std::string_view chunk) {
-        if(!head_finish) {
-            head.append(chunk);
-            // 头部还未结束，尝试判断头部是否结束
-            size_t headlen = head.find("\r\n\r\n");
-            if(headlen != std::string::npos) {
-                // 头部解析结束
-                head_finish = true;
-                // 把多余解析的body部分截取出来
-                body = head.substr(headlen);
-                head.resize(headlen);
-                // 分析头部中的Content-Length字段
-                body_finish = true;
+        debug_msg(std::string(chunk).c_str());
+        assert(!head_finished_);
+        head.append(chunk);
+        // 还在解析头部的话，判断头部是否解析结束
+        size_t head_len = head.find("\r\n\r\n");
+        if(head_len != std::string::npos) {
+            head_finished_ = true;
+            body = head.substr(head_len + 4);
+            head.resize(head_len);
+            // 开始分析头部，尝试提取content-length字段
+            _extract_headers();
+        }
+    }
+
+    std::string& headline() { 
+        return heading_line; 
+    }
+    StringMap& headers() {
+        return head_keys;
+    }
+    std::string& header_raw() {
+        return head;
+    }
+    std::string& extra_body() {
+        return body;
+    }
+
+};
+
+template <class HeaderParser = http11_header_parse>
+struct http_request_parser {
+    HeaderParser /*http11_header_parse*/ header_parser;
+    size_t content_length;
+    bool body_finish = false;
+
+    bool request_finished() {
+        return body_finish; // 正文结束了，不需要其他数据了
+    }
+
+    std::string& header_raw() {
+        return header_parser.header_raw();
+    }
+
+    StringMap& headers() {
+        return header_parser.headers();
+    }
+
+    std::string& body() {
+        return header_parser.extra_body();
+    }
+
+    size_t _extract_content_length() {
+        auto& headers = header_parser.headers();
+        auto it = headers.find("content-length");
+        if(it == headers.end()) {
+            return 0;
+        }
+        // stoi可能会抛出异常
+        try {
+            return std::stoi(it->second);
+        } catch(const std::invalid_argument&) {
+            return 0;
+        }
+    }
+
+    void push_chunk(std::string_view chunk) {
+        debug_msg(std::string(chunk).c_str());
+        if(!header_parser.head_finished()) {
+            header_parser.push_chunk(chunk);
+            if(header_parser.head_finished()) {
+                content_length = _extract_content_length();
+                // 判断正文是不是已经结束了
+                if(body().size() >= content_length) {
+                    body_finish = true;
+                    body().resize(content_length);
+                }
             }
         }else {
-            body.append(chunk);
+            body().append(chunk);
+            if(body().size() >= content_length) {
+                body_finish = true;
+                body().resize(content_length);
+            }
         }
     }
 
@@ -158,13 +277,14 @@ int main() {
             do{
                 ssize_t len = CHECK_CALL(read, connid, buf, sizeof(buf));
                 req_parser.push_chunk(std::string_view(buf, len));
-            } while (req_parser.need_more_chunks());
+            } while (!req_parser.request_finished());
             
-            auto req = req_parser.head;
-            fmt::println("req msg: ##{}##", req);
+            fmt::println("req head: {}", req_parser.header_raw());
+            fmt::println("req body: {}", req_parser.body());
 
-            std::string res = "HTTP/1,1 200 OK\r\nServer: c17_http\r\nConnection: close\r\nContent-length: 5\r\n\r\nHello";
-            fmt::println("res msg: ##{}##", res);
+            std::string res = std::string("HTTP/1.1 200 OK\r\nServer: c17_http\r\nConnection: close\r\nContent-length: ")
+                            + std::to_string(req_parser.body().size()) + ("\r\n\r\n") + req_parser.body();
+            fmt::println("res msg: {}", res);
             CHECK_CALL(write, connid, res.data(), res.size());
             close(connid);
         });
@@ -172,7 +292,5 @@ int main() {
     for(auto& t : pool) {
         t.join();
     }
-    
-
     return 0;
 }
