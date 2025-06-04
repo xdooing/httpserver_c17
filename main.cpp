@@ -56,17 +56,26 @@ const std::error_category& gai_category() {
 };
 
 
-template <class T>
-T check_error(const char* msg, T res) {
+// 由于要进行异步的原因，系统调用返回值 == -1 的时候不一定就要抛出异常，也可以直接返回
+template <int Except = 0, class T>
+T check_error(const char* what, T res) {
     if(res == -1) {
-        fmt::println("{}: {}", msg, strerror(errno));
+        if constexpr (Except != 0) {
+            if(errno == Except) {
+                return -1;
+            }
+        }
         auto ec = std::error_code(errno, std::system_category());
-        throw std::system_error(ec, msg);
+        fmt::println(stderr, "{}: {}", what, ec.message());
+        throw std::system_error(ec, what);
     }
     return res;
 }
 
-#define CHECK_CALL(func, ...) check_error(#func, func(__VA_ARGS__))
+#define SOURCE_INFO_IMPL(file, line) "In " file ":" #line ": "
+#define SOURCE_INFO() SOURCE_INFO_IMPL(__FILE__, __LINE__)
+#define CHECK_CALL_EXCEPT(except, func, ...) check_error<except>(SOURCE_INFO() #func, func(__VA_ARGS__))
+#define CHECK_CALL(func, ...) check_error(SOURCE_INFO() #func, func(__VA_ARGS__))
 
 struct socket_address_fatptr{
     struct sockaddr* addr;
@@ -133,6 +142,31 @@ struct address_resolver {
     }
 };
 
+struct bytes_const_view {
+    const char* data_;
+    size_t size_;
+
+    const char* data() const noexcept {
+        return data_;
+    }
+    size_t size() const noexcept {
+        return size_;
+    }
+    const char* begin() const noexcept {
+        return data();
+    }
+    const char* end() const noexcept {
+        return data() + size();
+    }
+
+    // TODO...
+    // bytes_const_view subspan
+
+    operator std::string_view() const noexcept {
+        return std::string_view{data(), size()};
+    }
+};
+
 struct bytes_view {
     char* data_;
     size_t size_;
@@ -146,15 +180,29 @@ struct bytes_view {
     char* begin() const noexcept {
         return data();
     }
+    char* end() const noexcept {
+        return data() + size();
+    }
 
+    // TODO...
+    // bytes_view subspan
 
-
+    operator bytes_const_view() const noexcept {
+        return bytes_const_view{data(), size()};
+    }
+    operator std::string_view() const noexcept {
+        return std::string_view{data(), size()};
+    }
 };
 
 struct bytes_buffer {
     std::vector<char> data_;
     bytes_buffer() = default;
+    bytes_buffer(bytes_buffer&&) = default;
+    bytes_buffer& operator=(bytes_buffer&&) = default;
+    explicit bytes_buffer(const bytes_buffer&) = default;
     explicit bytes_buffer(size_t n) : data_(n) {}
+
     const char* data() const noexcept{
         return data_.data();
     }
@@ -176,17 +224,33 @@ struct bytes_buffer {
     char* end() noexcept {
         return data() + size();        
     }
+
+    // TODO...
+    // bytes_const_view subspan()
+    // bytes_view subspan()
+
     operator bytes_const_view() const noexcept {
-        return bytes_const_view(data_.data(), data_.size());
+        return bytes_const_view{data_.data(), data_.size()};
     }
     operator bytes_view() noexcept {
-        return bytes_view(data_.data(), data_.size());
+        return bytes_view{data_.data(), data_.size()};
     }
     operator std::string_view() const noexcept {
-        return std::string_view(data_.data(), data_.size());
+        return std::string_view{data_.data(), data_.size()};
     }
     void append(bytes_const_view chunk) {
-        data_.insert(data_.begin(), chunk.begin(), chunk.end());
+        data_.insert(data_.end(), chunk.begin(), chunk.end());
+    }
+    void append(std::string_view chunk) {
+        data_.insert(data_.end(), chunk.begin(), chunk.end());
+    }
+
+    // TODO...
+    // template <size_t N>
+    // void append_literial
+
+    void clear() {
+        data_.clear();
     }
     void resize(size_t n) {
         data_.resize(n);
@@ -210,22 +274,21 @@ struct static_bytes_buffer {
         return N;
     }
     operator bytes_const_view() const noexcept {
-        return bytes_const_view(data_.data(), N);
+        return bytes_const_view{data_.data(), N};
     }
     operator bytes_view() noexcept {
-        return bytes_view(data_.data(), N);
+        return bytes_view{data_.data(), N};
     }
     operator std::string_view() const noexcept {
-        return std::string_view(data_.data(), data_.size());
+        return std::string_view{data_.data(), data_.size()};
     }
 };
 
-// TIME->1:22:17
 struct http11_header_parse {
     bytes_buffer header_;      // "GET / HTTP/1.1\nHost: xdoo.log\r\nAccept: */*\r\nConnection: close"
-    std::string heading_line_; // "GET / HTTP/1.1"
-    StringMap head_keys_;
-    std::string body_;
+    std::string headline_; // "GET / HTTP/1.1"
+    StringMap header_keys_;
+    std::string body_; // 不小心多读取的正文部分，如果有的话
     bool head_finished_ = false;
 
     bool head_finished() {
@@ -234,12 +297,13 @@ struct http11_header_parse {
 
     void _extract_headers() {
         std::string_view header = header_;
-        size_t pos = header.find("\r\n");
+        size_t pos = header.find("\r\n", 0, 2);
+        headline_ = std::string(header.substr(0, pos));
         while(pos != std::string::npos) {
             // skip "\r\n"
             pos += 2;
             // 从当前位置开始找，先找到下一行位置（可能为npose）
-            size_t next_pos = header.find("\r\n", pos);
+            size_t next_pos = header.find("\r\n", pos, 2);
             size_t line_len = std::string::npos;
             if(next_pos != std::string::npos){
                 // 如果下一行还不是结束，那么line_len设为本行开始到下一行的距离
@@ -258,40 +322,46 @@ struct http11_header_parse {
                     return c;
                 });
                 // c++17更高效的写法 等效于head_keys[key] = value 
-                head_keys_.insert_or_assign(std::move(key), value);
+                header_keys_.insert_or_assign(std::move(key), value);
             }
             pos = next_pos;
         }
     }
 
     void push_chunk(std::string_view chunk) {
-        debug_msg(std::string(chunk).c_str());
+        // debug_msg(std::string(chunk).c_str());
         assert(!head_finished_);
+        size_t old_size = header_.size();
         header_.append(chunk);
+        std::string_view header_view = header_;
         // 还在解析头部的话，判断头部是否解析结束
-        size_t head_len = header_.find("\r\n\r\n");
+        // "GET / HTTP/1.1\nHost: xdoo.log\r\nAccept: */*\r\nConnection: close"
+        if(old_size < 4) old_size = 4;
+        old_size -= 4;
+        size_t head_len = header_view.find("\r\n\r\n", old_size, 4);
         if(head_len != std::string::npos) {
+            // 找到'\r\n' 头部的读取结束
             head_finished_ = true;
-            body = head.substr(head_len + 4);
-            head.resize(head_len);
-            // 开始分析头部，尝试提取content-length字段
+            // 把不小心多读取的正文留下来
+            body_ = header_view.substr(head_len + 4);
+            header_.resize(head_len);
+            // 开始分析头部，尝试提取content-length等kv键值对
             _extract_headers();
         }
     }
 
     std::string& headline() { 
-        return heading_line; 
+        return headline_; 
     }
     StringMap& headers() {
-        return head_keys;
+        return header_keys_;
     }
-    std::string& header_raw() {
-        return head;
+    bytes_buffer& header_raw() {
+        return header_;
     }
     std::string& extra_body() {
-        return body;
+        return body_;
     }
-
 };
 
 template <class HeaderParser = http11_header_parse>
@@ -300,6 +370,9 @@ struct _http_base_parser {
     size_t content_length;
     size_t body_accumulated_length = 0;
     bool body_finish = false;
+
+    // TODO...
+    // void reset_state()
 
     bool header_finished() {
         return header_parser.head_finished();
@@ -441,6 +514,10 @@ struct async_file {
     int fd_;
 
     static async_file async_wrap(int fd) {
+        int flags = CHECK_CALL(fcntl, fd, F_GETFL);
+        // 将文件描述符设置为非阻塞
+        flags |= O_NONBLOCK;
+        CHECK_CALL(fcntl, fd, F_SETFL, flags);
         return async_file{fd};
     }
     
