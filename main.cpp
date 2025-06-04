@@ -13,6 +13,7 @@
 #include <map>
 #include <assert.h>
 #include <stdio.h>
+#include <functional>
 
 void debug_msg(const char* msg) {
     return;
@@ -39,18 +40,28 @@ struct addrinfo
 };
 #endif
 
-int check_error(const char* msg, int res) {
-    if(res == -1) {
-        fmt::println("{}: {}", msg, strerror(errno));
-        throw;
-    }
-    return res;
-}
+using StringMap = std::map<std::string, std::string>;
 
-ssize_t check_error(const char* msg, ssize_t res) {
+const std::error_category& gai_category() {
+    static struct final : std::error_category {
+        const char* name() const noexcept override {
+            return "getaddrinfo";
+        }
+        std::string message(int err) const override {
+            return gai_strerror(err);
+        }
+    } instance;
+    // 单例模式
+    return instance;
+};
+
+
+template <class T>
+T check_error(const char* msg, T res) {
     if(res == -1) {
         fmt::println("{}: {}", msg, strerror(errno));
-        throw;
+        auto ec = std::error_code(errno, std::system_category());
+        throw std::system_error(ec, msg);
     }
     return res;
 }
@@ -115,19 +126,106 @@ struct address_resolver {
     address_resolved_entry resolve(const std::string& name, const std::string& service) {
         int err = getaddrinfo(name.c_str(), service.c_str(), NULL, &head);
         if(err != 0) {
-            fmt::println("getaddrinfo {} {}", gai_strerror(err), err);
-            throw;
+            auto ec = std::error_code(err, gai_category());
+            throw std::system_error(ec, name + ":" + service);;
         }
         return {head};
     }
 };
 
-using StringMap = std::map<std::string, std::string>;
+struct bytes_view {
+    char* data_;
+    size_t size_;
+
+    char* data() const noexcept {
+        return data_;
+    }
+    size_t size() const noexcept {
+        return size_;
+    }
+    char* begin() const noexcept {
+        return data();
+    }
+
+
+
+};
+
+struct bytes_buffer {
+    std::vector<char> data_;
+    bytes_buffer() = default;
+    explicit bytes_buffer(size_t n) : data_(n) {}
+    const char* data() const noexcept{
+        return data_.data();
+    }
+    char* data() noexcept {
+        return data_.data();
+    }
+    size_t size() const noexcept {
+        return data_.size();
+    }
+    const char* begin() const noexcept {
+        return data();        
+    }
+    char* begin() noexcept {
+        return data();        
+    }
+    const char* end() const noexcept {
+        return data() + size();        
+    }
+    char* end() noexcept {
+        return data() + size();        
+    }
+    operator bytes_const_view() const noexcept {
+        return bytes_const_view(data_.data(), data_.size());
+    }
+    operator bytes_view() noexcept {
+        return bytes_view(data_.data(), data_.size());
+    }
+    operator std::string_view() const noexcept {
+        return std::string_view(data_.data(), data_.size());
+    }
+    void append(bytes_const_view chunk) {
+        data_.insert(data_.begin(), chunk.begin(), chunk.end());
+    }
+    void resize(size_t n) {
+        data_.resize(n);
+    }
+    void reserve(size_t n) {
+        data_.reserve(n);
+    }
+};
+
+template <size_t N>
+struct static_bytes_buffer {
+    std::array<char, N> data_;
+
+    const char* data() const noexcept {
+        return data_.data();
+    }
+    char* data() noexcept {
+        return data_.data();
+    }
+    static constexpr size_t size() noexcept {
+        return N;
+    }
+    operator bytes_const_view() const noexcept {
+        return bytes_const_view(data_.data(), N);
+    }
+    operator bytes_view() noexcept {
+        return bytes_view(data_.data(), N);
+    }
+    operator std::string_view() const noexcept {
+        return std::string_view(data_.data(), data_.size());
+    }
+};
+
+// TIME->1:22:17
 struct http11_header_parse {
-    std::string head;
-    std::string heading_line;
-    StringMap head_keys;
-    std::string body;
+    bytes_buffer header_;      // "GET / HTTP/1.1\nHost: xdoo.log\r\nAccept: */*\r\nConnection: close"
+    std::string heading_line_; // "GET / HTTP/1.1"
+    StringMap head_keys_;
+    std::string body_;
     bool head_finished_ = false;
 
     bool head_finished() {
@@ -135,19 +233,20 @@ struct http11_header_parse {
     }
 
     void _extract_headers() {
-        size_t pos = head.find("\r\n");
+        std::string_view header = header_;
+        size_t pos = header.find("\r\n");
         while(pos != std::string::npos) {
             // skip "\r\n"
             pos += 2;
             // 从当前位置开始找，先找到下一行位置（可能为npose）
-            size_t next_pos = head.find("\r\n", pos);
+            size_t next_pos = header.find("\r\n", pos);
             size_t line_len = std::string::npos;
             if(next_pos != std::string::npos){
                 // 如果下一行还不是结束，那么line_len设为本行开始到下一行的距离
                 line_len = next_pos - pos;
             }
             // 切下本行
-            std::string_view line = std::string_view(head).substr(pos, line_len);
+            std::string_view line = header.substr(pos, line_len);
             size_t colon = line.find(": ");
             if(colon != std::string::npos) {
                 std::string key = std::string(line.substr(0, colon));
@@ -159,7 +258,7 @@ struct http11_header_parse {
                     return c;
                 });
                 // c++17更高效的写法 等效于head_keys[key] = value 
-                head_keys.insert_or_assign(std::move(key), value);
+                head_keys_.insert_or_assign(std::move(key), value);
             }
             pos = next_pos;
         }
@@ -168,9 +267,9 @@ struct http11_header_parse {
     void push_chunk(std::string_view chunk) {
         debug_msg(std::string(chunk).c_str());
         assert(!head_finished_);
-        head.append(chunk);
+        header_.append(chunk);
         // 还在解析头部的话，判断头部是否解析结束
-        size_t head_len = head.find("\r\n\r\n");
+        size_t head_len = header_.find("\r\n\r\n");
         if(head_len != std::string::npos) {
             head_finished_ = true;
             body = head.substr(head_len + 4);
@@ -196,65 +295,180 @@ struct http11_header_parse {
 };
 
 template <class HeaderParser = http11_header_parse>
-struct http_request_parser {
-    HeaderParser /*http11_header_parse*/ header_parser;
+struct _http_base_parser {
+    /*HeaderParser*/ http11_header_parse header_parser;
     size_t content_length;
+    size_t body_accumulated_length = 0;
     bool body_finish = false;
+
+    bool header_finished() {
+        return header_parser.head_finished();
+    }
 
     bool request_finished() {
         return body_finish; // 正文结束了，不需要其他数据了
     }
-
     std::string& header_raw() {
         return header_parser.header_raw();
     }
-
+    std::string& headline() {
+        return header_parser.headline();
+    }
     StringMap& headers() {
         return header_parser.headers();
     }
 
-    std::string& body() {
-        return header_parser.extra_body();
+    std::string _headline_first() {
+        // "GET / HTTP/1.1"  --> request
+        // "HTTP/1.1 200 ok" --> response
+        auto& line = headline();
+        size_t space = line.find(' ');
+        if(space == std::string::npos){
+            return "";
+        }
+        return line.substr(0, space);
     }
 
-    size_t _extract_content_length() {
-        auto& headers = header_parser.headers();
-        auto it = headers.find("content-length");
-        if(it == headers.end()) {
-            return 0;
+    std::string _headline_second() {
+        // "GET / HTTP/1.1"
+        auto& line = headline();
+        size_t space1 = line.find(' ');
+        if(space1 == std::string::npos){
+            return "";
         }
-        // stoi可能会抛出异常
+        size_t space2 = line.find(' ', space1);
+        if(space2 == std::string::npos) {
+            return "";
+        }
+        return line.substr(space1, space2);
+    }
+
+    std::string _headline_third() {
+        auto& line = headline();
+        size_t space1 = line.find(' ');
+        if(space1 == std::string::npos) {
+            return "";
+        }
+        size_t space2 = line.find(' ', space1);
+        if(space2 == std::string::npos) {
+            return "";
+        }
+        return line.substr(space2);
+    }
+};
+
+template <class HeaderParser = http11_header_parse>
+struct http_request_parser : _http_base_parser<HeaderParser> {
+    std::string method() {
+        // "GET / HTTP/1.1"
+        return this->_headline_first();
+    }
+    std::string url() {
+        // "GET / HTTP/1.1"
+        return this->_headline_second();
+    }
+    std::string http_version() {
+        // "GET / HTTP/1.1"
+        return this->_headline_third();
+    }
+    // std::string& body() {
+    //     return header_parser.extra_body();
+    // }
+
+    // size_t _extract_content_length() {
+    //     auto& headers = header_parser.headers();
+    //     auto it = headers.find("content-length");
+    //     if(it == headers.end()) {
+    //         return 0;
+    //     }
+    //     // stoi可能会抛出异常
+    //     try {
+    //         return std::stoi(it->second);
+    //     } catch(const std::invalid_argument&) {
+    //         return 0;
+    //     }
+    // }
+
+    // void push_chunk(std::string_view chunk) {
+    //     debug_msg(std::string(chunk).c_str());
+    //     if(!header_parser.head_finished()) {
+    //         header_parser.push_chunk(chunk);
+    //         if(header_parser.head_finished()) {
+    //             content_length = _extract_content_length();
+    //             // 判断正文是不是已经结束了
+    //             if(body().size() >= content_length) {
+    //                 body_finish = true;
+    //                 body().resize(content_length);
+    //             }
+    //         }
+    //     }else {
+    //         body().append(chunk);
+    //         if(body().size() >= content_length) {
+    //             body_finish = true;
+    //             body().resize(content_length);
+    //         }
+    //     }
+    // }
+};
+
+template <class HeaderParser = http11_header_parse>
+struct http_response_parser : _http_base_parser<HeaderParser> {
+    // "HTTP/1.1 200 ok" --> response
+    std::string http_version() {
+        return this->_headline_first();
+    }
+    int status() {
+        auto s = this->_headline_second();
         try {
-            return std::stoi(it->second);
-        } catch(const std::invalid_argument&) {
-            return 0;
+            return std::stoi(s);
+        } catch(const std::logic_error&) {
+            return -1;
         }
     }
 
-    void push_chunk(std::string_view chunk) {
-        debug_msg(std::string(chunk).c_str());
-        if(!header_parser.head_finished()) {
-            header_parser.push_chunk(chunk);
-            if(header_parser.head_finished()) {
-                content_length = _extract_content_length();
-                // 判断正文是不是已经结束了
-                if(body().size() >= content_length) {
-                    body_finish = true;
-                    body().resize(content_length);
-                }
-            }
-        }else {
-            body().append(chunk);
-            if(body().size() >= content_length) {
-                body_finish = true;
-                body().resize(content_length);
-            }
-        }
+    std::string status_string() {
+        return this->_headline_third();
     }
-
 };
 
 std::vector<std::thread> pool;
+
+// 异步
+template <class... Args>
+using callback = std::function<void(Args...)>;
+
+struct async_file {
+    int fd_;
+
+    static async_file async_wrap(int fd) {
+        return async_file{fd};
+    }
+    
+    ssize_t sync_read(bytes_view buf) {
+        return CHECK_CALL(read, fd_, buf.data(), buf.size());
+    }
+
+    void sync_read(bytes_view buf, callback<ssize_t> cb) {
+        ssize_t ret =  CHECK_CALL(read, fd_, buf.data(), buf.size());
+        cb(ret);
+    }
+
+    ssize_t sync_write(bytes_view buf) {
+        return CHECK_CALL(write, fd_, buf.data(), buf.size());
+    }
+
+    void sync_write(bytes_view buf, callback<ssize_t> cb) {
+        ssize_t ret =  CHECK_CALL(write, fd_, buf.data(), buf.size());
+        cb(ret);
+    }
+};
+
+void server() {
+   // TIME-> 1:24:20 
+}
+
+
+
 int main() {
     std::string ip = "127.0.0.1";
     std::string port = "8080";
