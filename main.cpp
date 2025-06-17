@@ -245,9 +245,10 @@ struct bytes_buffer {
         data_.insert(data_.end(), chunk.begin(), chunk.end());
     }
 
-    // TODO...
-    // template <size_t N>
-    // void append_literial
+    template <size_t N>
+    void append_literial(const char (&literial)[N]) {
+        append(std::string_view{literial, N - 1});
+    }
 
     void clear() {
         data_.clear();
@@ -328,8 +329,7 @@ struct http11_header_parse {
         }
     }
 
-    void push_chunk(std::string_view chunk) {
-        // debug_msg(std::string(chunk).c_str());
+    void push_chunk(bytes_const_view chunk) {
         assert(!head_finished_);
         size_t old_size = header_.size();
         header_.append(chunk);
@@ -368,7 +368,7 @@ template <class HeaderParser = http11_header_parse>
 struct _http_base_parser {
     /*HeaderParser*/ http11_header_parse header_parser;
     size_t content_length;
-    size_t body_accumulated_length = 0;
+    size_t body_accumulated_size = 0;
     bool body_finish = false;
 
     // TODO...
@@ -428,6 +428,49 @@ struct _http_base_parser {
         }
         return line.substr(space2);
     }
+
+    std::string& body() {
+        return header_parser.extra_body();
+    }
+
+    size_t _extract_content_length() {
+        auto& headers = header_parser.headers();
+        auto it = headers.find("content-length");
+        if(it == headers.end()) {
+            return 0;
+        }
+        // stoi可能会抛出异常
+        try {
+            return std::stoi(it->second);
+        } catch(const std::logic_error&) {
+            return 0;
+        }
+    }
+
+    void push_chunk(bytes_const_view chunk) {
+        assert(!body_finish);
+        if(!header_parser.head_finished()) {
+            header_parser.push_chunk(chunk);
+            if(header_parser.head_finished()) {
+                body_accumulated_size = body().size();
+                content_length = _extract_content_length();
+                // 判断正文是不是已经结束了
+                if(body_accumulated_size >= content_length) {
+                    body_finish = true;
+                }
+            }
+        }else {
+            body().append(chunk);
+            body_accumulated_size += chunk.size();
+            if(body_accumulated_size >= content_length) {
+                body_finish = true;
+            }
+        }
+    }
+
+    // std::string read_some_body() {
+    //     return std::move(body());
+    // }
 };
 
 template <class HeaderParser = http11_header_parse>
@@ -440,56 +483,18 @@ struct http_request_parser : _http_base_parser<HeaderParser> {
         // "GET / HTTP/1.1"
         return this->_headline_second();
     }
-    std::string http_version() {
-        // "GET / HTTP/1.1"
-        return this->_headline_third();
-    }
-    // std::string& body() {
-    //     return header_parser.extra_body();
-    // }
-
-    // size_t _extract_content_length() {
-    //     auto& headers = header_parser.headers();
-    //     auto it = headers.find("content-length");
-    //     if(it == headers.end()) {
-    //         return 0;
-    //     }
-    //     // stoi可能会抛出异常
-    //     try {
-    //         return std::stoi(it->second);
-    //     } catch(const std::invalid_argument&) {
-    //         return 0;
-    //     }
-    // }
-
-    // void push_chunk(std::string_view chunk) {
-    //     debug_msg(std::string(chunk).c_str());
-    //     if(!header_parser.head_finished()) {
-    //         header_parser.push_chunk(chunk);
-    //         if(header_parser.head_finished()) {
-    //             content_length = _extract_content_length();
-    //             // 判断正文是不是已经结束了
-    //             if(body().size() >= content_length) {
-    //                 body_finish = true;
-    //                 body().resize(content_length);
-    //             }
-    //         }
-    //     }else {
-    //         body().append(chunk);
-    //         if(body().size() >= content_length) {
-    //             body_finish = true;
-    //             body().resize(content_length);
-    //         }
-    //     }
+    // std::string http_version() {
+    //     // "GET / HTTP/1.1"
+    //     return this->_headline_third();
     // }
 };
 
 template <class HeaderParser = http11_header_parse>
 struct http_response_parser : _http_base_parser<HeaderParser> {
     // "HTTP/1.1 200 ok" --> response
-    std::string http_version() {
-        return this->_headline_first();
-    }
+    // std::string http_version() {
+    //     return this->_headline_first();
+    // }
     int status() {
         auto s = this->_headline_second();
         try {
@@ -498,11 +503,85 @@ struct http_response_parser : _http_base_parser<HeaderParser> {
             return -1;
         }
     }
+    // std::string status_string() {
+    //     return this->_headline_third();
+    // }
+};
 
-    std::string status_string() {
-        return this->_headline_third();
+struct http11_header_writer {
+    bytes_buffer buffer_;
+
+    void reset_state() {
+        buffer_.clear();
+    }
+
+    bytes_buffer& buffer() {
+        return buffer_;
+    }
+
+    void begin_header(std::string_view first,
+                      std::string_view second,
+                      std::string_view third) {
+        buffer_.append(first);
+        buffer_.append_literial(" ");
+        buffer_.append(second);
+        buffer_.append_literial(" ");
+        buffer_.append(third);
+    }
+
+    void write_header(std::string_view key, std::string_view value) {
+        buffer_.append_literial("\r\n");
+        buffer_.append(key);
+        buffer_.append_literial(": ");
+        buffer_.append(value);
+    }
+
+    void end_header() {
+        buffer_.append_literial("\r\n\r\n");
     }
 };
+
+template <class HeaderWriter = http11_header_writer>
+struct _http_base_writer {
+    /*HeaderWriter*/ http11_header_writer header_writer_;
+
+    void _begin_header(std::string_view first,
+                       std::string_view second,
+                       std::string_view third) {
+        header_writer_.begin_header(first, second, third);
+    }
+
+    void reset_state() {
+        header_writer_.reset_state();
+    }
+    bytes_buffer& buffer() {
+        return header_writer_.buffer();
+    }
+    void write_header(std::string_view key, std::string_view value) {
+        header_writer_.write_header(key, value);
+    }
+    void end_header() {
+        header_writer_.end_header();
+    }
+    void write_body(std::string_view body) {
+        header_writer_.buffer().append(body);
+    }
+};
+
+template <class HeaderWriter = http11_header_writer>
+struct http_request_writer : _http_base_writer<HeaderWriter> {
+    void begin_header(std::string_view method, std::string_view url) {
+        this->_begin_header(method, url, "HTTP/1.1");
+    }
+};
+
+template <class HeaderWriter = http11_header_writer>
+struct http_response_writer : _http_base_writer<HeaderWriter> {
+    void begin_header(int status) {
+        this->_begin_header("HTTP/1.1", std::to_string(status), "OK");
+    }
+};
+
 
 std::vector<std::thread> pool;
 
