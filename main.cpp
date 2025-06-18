@@ -146,6 +146,15 @@ struct bytes_const_view {
     const char* data_;
     size_t size_;
 
+    bytes_const_view() noexcept : data_(nullptr), size_(0) {}
+    bytes_const_view(const char* data, size_t size) noexcept 
+        : data_(data), size_(size) {}
+    explicit bytes_const_view(const std::string& s) noexcept 
+        : data_(s.data()), size_(s.size()) {}
+    // 添加接受 std::string_view 的构造函数（可以是非 explicit 的，以实现隐式转换）
+    bytes_const_view(std::string_view sv) noexcept 
+        : data_(sv.data()), size_(sv.size()) {}
+
     const char* data() const noexcept {
         return data_;
     }
@@ -237,6 +246,9 @@ struct bytes_buffer {
     }
     operator std::string_view() const noexcept {
         return std::string_view{data_.data(), data_.size()};
+    }
+    operator std::string() const noexcept {
+        return std::string(data_.begin(), data_.end());
     }
     void append(bytes_const_view chunk) {
         data_.insert(data_.end(), chunk.begin(), chunk.end());
@@ -381,7 +393,7 @@ struct _http_base_parser {
     bool request_finished() {
         return body_finish; // 正文结束了，不需要其他数据了
     }
-    std::string& header_raw() {
+    std::string header_raw() {
         return header_parser.header_raw();
     }
     std::string& headline() {
@@ -649,13 +661,24 @@ int main() {
                 req_parser.push_chunk(std::string_view(buf, len));
             } while (!req_parser.request_finished());
             
-            fmt::println("req head: {}", req_parser.header_raw());
-            fmt::println("req body: {}", req_parser.body());
+            fmt::println("recv req head: {}", req_parser.header_raw());
+            fmt::println("recv req body: {}", req_parser.body());
+            std::string body = req_parser.body();
 
-            std::string res = std::string("HTTP/1.1 200 OK\r\nServer: c17_http\r\nConnection: close\r\nContent-length: ")
-                            + std::to_string(req_parser.body().size()) + ("\r\n\r\n") + req_parser.body();
-            fmt::println("res msg: {}", res);
-            CHECK_CALL(write, connid, res.data(), res.size());
+            http_response_writer res_writer;
+            res_writer.begin_header(200);
+            res_writer.write_header("Server", "c17_http");
+            res_writer.write_header("Connection", "close");
+            res_writer.write_header("Content-length", std::to_string(body.size()));
+            res_writer.end_header();
+            auto& buffer = res_writer.buffer();
+            CHECK_CALL(write, connid, buffer.data(), buffer.size());
+            CHECK_CALL(write, connid, body.data(), body.size());
+
+            fmt::println("send res head: {}", std::string(buffer));
+            fmt::println("send res body: {}", body);
+
+            // res_writer.write_body(body);
             close(connid);
         });
     }
