@@ -72,55 +72,56 @@ T check_error(const char* what, T res) {
     return res;
 }
 
-#define SOURCE_INFO_IMPL(file, line) "In " file ":" #line ": "
+#define STRINGIZE(x) #x
+#define SOURCE_INFO_IMPL(file, line) "In " file ":" STRINGIZE(line) ": "
 #define SOURCE_INFO() SOURCE_INFO_IMPL(__FILE__, __LINE__)
 #define CHECK_CALL_EXCEPT(except, func, ...) check_error<except>(SOURCE_INFO() #func, func(__VA_ARGS__))
 #define CHECK_CALL(func, ...) check_error(SOURCE_INFO() #func, func(__VA_ARGS__))
 
-struct socket_address_fatptr{
-    struct sockaddr* addr;
-    socklen_t addrlen;
-};
-struct socket_address_storage {
-    union {
-        struct sockaddr addr;                 // 通用地址结构
-        struct sockaddr_storage addr_storage; // 足够大的存储空间（兼容 IPv4/IPv6）
-    };
-    socklen_t addrlen = sizeof(struct sockaddr_storage);
-    // 隐式转换为 socket_address_fatptr
-    operator socket_address_fatptr() {
-        return {&addr, addrlen};
-    }
-};
-
-struct address_resolved_entry {
-    struct addrinfo* current = nullptr;
-    socket_address_fatptr get_address() const {
-        return {current->ai_addr, current->ai_addrlen};
-    }
-    int create_socket() const {
-        int socketfd = CHECK_CALL(socket, current->ai_family, current->ai_socktype, current->ai_protocol);
-        // 设置端口复用
-        int opt = 1;
-        setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        return socketfd;
-    }
-    bool next_entry() {
-        current = current->ai_next;
-        return (current != nullptr);
-    }
-
-    int create_socket_and_bind() {
-        int socketfd = create_socket();
-        socket_address_fatptr addr = get_address();
-        // bind
-        CHECK_CALL(bind, socketfd, addr.addr, addr.addrlen);
-        return socketfd;
-    }
-
-};
 
 struct address_resolver {
+    struct socket_address_fatptr{
+        struct sockaddr* addr;
+        socklen_t addrlen;
+    };
+    struct socket_address_storage {
+        union {
+            struct sockaddr addr;                 // 通用地址结构
+            struct sockaddr_storage addr_storage; // 足够大的存储空间（兼容 IPv4/IPv6）
+        };
+        socklen_t addrlen = sizeof(struct sockaddr_storage);
+        // 隐式转换为 socket_address_fatptr
+        operator socket_address_fatptr() {
+            return {&addr, addrlen};
+        }
+    };
+
+    struct address_resolved_entry {
+        struct addrinfo* current = nullptr;
+        socket_address_fatptr get_address() const {
+            return {current->ai_addr, current->ai_addrlen};
+        }
+        int create_socket() const {
+            int socketfd = CHECK_CALL(socket, current->ai_family, current->ai_socktype, current->ai_protocol);
+            // 设置端口复用
+            int opt = 1;
+            setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            return socketfd;
+        }
+        bool next_entry() {
+            current = current->ai_next;
+            return (current != nullptr);
+        }
+
+        int create_socket_and_bind() {
+            int socketfd = create_socket();
+            socket_address_fatptr addr = get_address();
+            // bind
+            CHECK_CALL(bind, socketfd, addr.addr, addr.addrlen);
+            return socketfd;
+        }
+    };
+
     struct addrinfo* head = nullptr;
 
     address_resolver() = default;
@@ -168,8 +169,16 @@ struct bytes_const_view {
         return data() + size();
     }
 
-    // TODO...
-    // bytes_const_view subspan
+    bytes_const_view subspan(size_t start,
+                             size_t len = static_cast<size_t>(-1)) const {
+        if (start > size()) {
+            throw std::out_of_range("bytes_const_view::subspan");
+        }
+        if (len > size() - start) {
+            len = size() - start;
+        }
+        return {data() + start, len};
+    }
 
     operator std::string_view() const noexcept {
         return std::string_view{data(), size()};
@@ -179,6 +188,14 @@ struct bytes_const_view {
 struct bytes_view {
     char* data_;
     size_t size_;
+
+    bytes_view(std::string sv) noexcept 
+        : data_(sv.data()), size_(sv.size()) {}
+    bytes_view(std::string_view sv) noexcept 
+        : data_(const_cast<char*>(sv.data())), size_(sv.size()) {}
+    
+    bytes_view(char* data, size_t size) noexcept
+        : data_(data), size_(size) {}
 
     char* data() const noexcept {
         return data_;
@@ -193,8 +210,15 @@ struct bytes_view {
         return data() + size();
     }
 
-    // TODO...
-    // bytes_view subspan
+    bytes_view subspan(size_t start, size_t len) const {
+        if (start > size()) {
+            throw std::out_of_range("bytes_view::subspan");
+        }
+        if (len > size() - start) {
+            len = size() - start;
+        }
+        return bytes_view(data() + start, len);
+    }
 
     operator bytes_const_view() const noexcept {
         return bytes_const_view{data(), size()};
@@ -234,9 +258,13 @@ struct bytes_buffer {
         return data() + size();        
     }
 
-    // TODO...
-    // bytes_const_view subspan()
-    // bytes_view subspan()
+    bytes_const_view subspan(size_t start, size_t len) const {
+        return operator bytes_const_view().subspan(start, len);
+    }
+
+    bytes_view subspan(size_t start, size_t len) {
+        return operator bytes_view().subspan(start, len);
+    }
 
     operator bytes_const_view() const noexcept {
         return bytes_const_view{data_.data(), data_.size()};
@@ -611,13 +639,19 @@ struct async_file {
         CHECK_CALL(fcntl, fd, F_SETFL, flags);
         return async_file{fd};
     }
-    
+    // 阻塞read
     ssize_t sync_read(bytes_view buf) {
         return CHECK_CALL(read, fd_, buf.data(), buf.size());
     }
-
-    void sync_read(bytes_view buf, callback<ssize_t> cb) {
-        ssize_t ret =  CHECK_CALL(read, fd_, buf.data(), buf.size());
+    
+    // 非阻塞read
+    void async_read(bytes_view buf, callback<ssize_t> cb) {
+        ssize_t ret;
+        // 如果read返回值是 EAGAIN,那就是没有读到数据，需要再次尝试
+        do {
+            // time -> 1:31:27
+            ret = CHECK_CALL_EXCEPT(EAGAIN, read, fd_, buf.data(), buf.size());
+        } while (ret == -1);
         cb(ret);
     }
 
@@ -625,21 +659,13 @@ struct async_file {
         return CHECK_CALL(write, fd_, buf.data(), buf.size());
     }
 
-    void sync_write(bytes_view buf, callback<ssize_t> cb) {
+    void async_write(bytes_view buf, callback<ssize_t> cb) {
         ssize_t ret =  CHECK_CALL(write, fd_, buf.data(), buf.size());
         cb(ret);
     }
 };
 
-void server() {
-   // TIME-> 1:24:20 
-}
-
-
-
-int main() {
-    std::string ip = "127.0.0.1";
-    std::string port = "8080";
+void server(std::string ip, std::string port) {
 
     fmt::println("Listening {}:{}", ip, port);
     
@@ -650,38 +676,61 @@ int main() {
 
     //accept
     while(true) {
-        socket_address_storage addr;
+        address_resolver::socket_address_storage addr;
         int connid = CHECK_CALL(accept, listenfd, &addr.addr, &addr.addrlen);
+        fmt::println("NEW CONNECTION <{}>", connid);
         // handle by thread
         pool.emplace_back([connid](){
-            char buf[1024];
-            http_request_parser req_parser;
-            do{
-                ssize_t len = CHECK_CALL(read, connid, buf, sizeof(buf));
-                req_parser.push_chunk(std::string_view(buf, len));
-            } while (!req_parser.request_finished());
+            auto conn = async_file::async_wrap(connid);
+            bytes_buffer buf(1024);
+            while(true) {
+                http_request_parser req_parser;
+                do{
+                    ssize_t len = conn.sync_read(buf);
+                    // 如果读到EOF,说明对面关闭了连接
+                    if(len == 0) {
+                        fmt::println("CONNECTION SHUT DOWN<{}>", connid);
+                        goto quit;
+                    }
+                    req_parser.push_chunk(buf.subspan(0, len));
+                } while (!req_parser.request_finished());
             
-            fmt::println("recv req head: {}", req_parser.header_raw());
-            fmt::println("recv req body: {}", req_parser.body());
-            std::string body = req_parser.body();
+                fmt::println("recv req head: {}", req_parser.header_raw());
+                fmt::println("recv req body: {}", req_parser.body());
+                std::string body = req_parser.body();
 
-            http_response_writer res_writer;
-            res_writer.begin_header(200);
-            res_writer.write_header("Server", "c17_http");
-            res_writer.write_header("Connection", "close");
-            res_writer.write_header("Content-length", std::to_string(body.size()));
-            res_writer.end_header();
-            auto& buffer = res_writer.buffer();
-            CHECK_CALL(write, connid, buffer.data(), buffer.size());
-            CHECK_CALL(write, connid, body.data(), body.size());
+                http_response_writer res_writer;
+                res_writer.begin_header(200);
+                res_writer.write_header("Server", "c17_http");
+                res_writer.write_header("Connection", "keep-alive");
+                res_writer.write_header("Content-length", std::to_string(body.size()));
+                res_writer.end_header();
+                auto& buffer = res_writer.buffer();
+                conn.sync_write(buffer);
+                conn.sync_write(body);
 
-            fmt::println("send res head: {}", std::string(buffer));
-            fmt::println("send res body: {}", body);
-
+                fmt::println("send res head: {}", std::string(buffer));
+                fmt::println("send res body: {}", body);
+            }
             // res_writer.write_body(body);
+        quit:
+            fmt::println("CONNECTION CLOSE <{}>", connid);
             close(connid);
         });
     }
+}
+
+
+int main() {
+    std::string ip = "127.0.0.1";
+    std::string port = "8080";
+
+    try {
+        server(ip, port);
+    } catch(const std::exception& e) {
+        fmt::println("Error: {}", e.what());
+    }
+    
     for(auto& t : pool) {
         t.join();
     }
