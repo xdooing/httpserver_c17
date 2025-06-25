@@ -14,6 +14,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <functional>
+#include <type_traits>
+#include <deque>
 
 void debug_msg(const char* msg) {
     return;
@@ -336,6 +338,14 @@ struct http11_header_parse {
         return head_finished_;
     }
 
+    void reset_state() {
+        header_.clear();
+        headline_.clear();
+        header_keys_.clear();
+        body_.clear();
+        head_finished_ = false;
+    }
+
     void _extract_headers() {
         std::string_view header = header_;
         size_t pos = header.find("\r\n", 0, 2);
@@ -411,8 +421,12 @@ struct _http_base_parser {
     size_t body_accumulated_size = 0;
     bool body_finish = false;
 
-    // TODO...
-    // void reset_state()
+    void reset_state() {
+        header_parser.reset_state();
+        content_length = 0;
+        body_accumulated_size = 0;
+        body_finish = false;
+    }
 
     bool header_finished() {
         return header_parser.head_finished();
@@ -608,6 +622,69 @@ struct _http_base_writer {
     }
 };
 
+template <class... Args>
+struct callback {
+    struct _callback_base{
+        virtual void _call(Args... args) = 0;
+        virtual ~_callback_base() = default;
+    };
+
+    // final: 禁止继承
+    template <class F>
+    struct _callback_impl final : _callback_base {
+        F func_;
+        template <class... Ts, class = std::enable_if_t<std::is_constructible_v<F, Ts...>>>
+        _callback_impl(Ts&&... ts) : func_(std::forward<Ts>(ts)...) { }
+
+        void _call(Args... args) override {
+            func_(std::forward<Args>(args)...);
+        }
+    };
+
+    std::unique_ptr<_callback_base> base_;
+
+    template <class F, class = std::enable_if_t<std::is_invocable_v<F, Args...> && !std::is_same_v<std::decay_t<F>, callback>>>
+    callback(F&& f) : base_(std::make_unique<_callback_impl<std::decay_t<F>>>(std::forward<F>(f))) { }
+
+    callback() = default;
+    callback(callback&&) = default;
+    callback& operator=(callback&&) = default;
+    callback(const callback&) = delete;
+    callback& operator=(const callback&) = delete;
+
+    void operator()(Args... args) {
+        assert(base_);
+        base_->_call(std::forward<Args>(args)...);
+        base_ = nullptr; // 所有回调，只能调用一次
+    }
+
+    // TODO
+    // void operator()(multishot_call_t, Args... args) const {
+    //     assert(m_base);
+    //     m_base->_call(std::forward<Args>(args)...);
+    // }
+
+    void* get_address() const noexcept {
+        return static_cast<void *>(base_.get());
+    }
+
+    void* leak_address() noexcept {
+        return static_cast<void *>(base_.release());
+    }
+
+    // static callback from_address(void *addr) noexcept {
+    //     callback cb;
+    //     cb.m_base = std::unique_ptr<_callback_base>(
+    //         static_cast<_callback_base *>(addr));
+    //     return cb;
+    // }
+
+    explicit operator bool() const noexcept {
+        return base_ != nullptr;
+    }
+
+};
+
 template <class HeaderWriter = http11_header_writer>
 struct http_request_writer : _http_base_writer<HeaderWriter> {
     void begin_header(std::string_view method, std::string_view url) {
@@ -623,11 +700,8 @@ struct http_response_writer : _http_base_writer<HeaderWriter> {
 };
 
 
-std::vector<std::thread> pool;
-
 // 异步
-template <class... Args>
-using callback = std::function<void(Args...)>;
+std::deque<callback<>> to_be_called_later;
 
 struct async_file {
     int fd_;
@@ -641,18 +715,28 @@ struct async_file {
     }
     // 阻塞read
     ssize_t sync_read(bytes_view buf) {
-        return CHECK_CALL(read, fd_, buf.data(), buf.size());
+        // 这里相当于用while循环模拟了一下阻塞read，毕竟fd已经被置为了非阻塞，直接用read的话可能会返回EAGAIN
+        ssize_t ret;
+        do {
+            ret = CHECK_CALL_EXCEPT(EAGAIN, read, fd_, buf.data(), buf.size());
+        } while (ret == -1);
+        return ret;
     }
     
     // 非阻塞read
     void async_read(bytes_view buf, callback<ssize_t> cb) {
-        ssize_t ret;
-        // 如果read返回值是 EAGAIN,那就是没有读到数据，需要再次尝试
-        do {
-            // time -> 1:31:27
-            ret = CHECK_CALL_EXCEPT(EAGAIN, read, fd_, buf.data(), buf.size());
-        } while (ret == -1);
-        cb(ret);
+        ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN, read, fd_, buf.data(), buf.size());
+        if(ret != -1) {
+            cb(ret);
+        }else {
+            // cb = std::move(cb) 表示移动捕获，表示将cb的所有权转移到lambda函数内
+            // 外部的cb会变的无效，也就是移出状态，这被视为一种修改，因此这里需要是用 mutable
+            // 当需要在 lambda 内修改按值捕获的变量时，必须使用 mutable
+            to_be_called_later.push_back([this, buf, cb = std::move(cb)] () mutable {
+                async_read(buf, std::move(cb));
+            });
+        }
+        // time: 1:54:42
     }
 
     ssize_t sync_write(bytes_view buf) {
@@ -660,8 +744,66 @@ struct async_file {
     }
 
     void async_write(bytes_view buf, callback<ssize_t> cb) {
-        ssize_t ret =  CHECK_CALL(write, fd_, buf.data(), buf.size());
-        cb(ret);
+        cb(CHECK_CALL(write, fd_, buf.data(), buf.size()));
+    }
+};
+
+struct http_connection_handler {
+    async_file conn_;
+    bytes_buffer buf_{1024};
+    // 类模板参数推导是C++17才引入的特性，而类成员声明语法保持了向前兼容
+    // 所以其他局部变量可以直接 http_request_parser req_parser_;
+    http_request_parser<> req_parser_;
+
+    void do_init(int connfd) {
+        conn_ = async_file::async_wrap(connfd);
+        // 初始化的时候就开始read，因为是非阻塞的，暂时读不到数据的话会延迟调用callback函数的
+        do_read();
+    }
+
+    void do_read() {
+        fmt::println("begin read...");
+        // 这里的ssize_t n 看似是参数，实际上可以理解为回调函数的返回值
+        conn_.async_read(buf_, [this](ssize_t n){
+            if(n == 0) {
+                fmt::println("CONNECTION SHUT DOWN.");
+                do_close();
+                return;
+            }
+            req_parser_.push_chunk(buf_.subspan(0, n));
+            if(!req_parser_.request_finished()) {
+                do_read();
+            }else {
+                do_write();
+            }
+        });
+    }
+
+    void do_write() {
+        std::string body = std::move(req_parser_.body());
+        req_parser_.reset_state();
+        if(body.empty()) {
+            body = "your request is empty";
+        }else {
+            body = fmt::format("your request is [{}], total {} bytes", body, body.size());
+        }
+        http_response_writer res_writer;
+        res_writer.begin_header(200);
+        res_writer.write_header("Server", "c17_http");
+        res_writer.write_header("Connection", "keep-alive");
+        res_writer.write_header("Content-length", std::to_string(body.size()));
+        res_writer.end_header();
+        auto& buffer = res_writer.buffer();
+        conn_.sync_write(buffer);
+        conn_.sync_write(body);
+
+        // 继续read，因为是 keep-alive
+        do_read();
+    }
+
+    void do_close() {
+        close(conn_.fd_);
+        delete this;
     }
 };
 
@@ -675,49 +817,21 @@ void server(std::string ip, std::string port) {
     CHECK_CALL(listen, listenfd, SOMAXCONN);
 
     //accept
-    while(true) {
-        address_resolver::socket_address_storage addr;
-        int connid = CHECK_CALL(accept, listenfd, &addr.addr, &addr.addrlen);
-        fmt::println("NEW CONNECTION <{}>", connid);
-        // handle by thread
-        pool.emplace_back([connid](){
-            auto conn = async_file::async_wrap(connid);
-            bytes_buffer buf(1024);
-            while(true) {
-                http_request_parser req_parser;
-                do{
-                    ssize_t len = conn.sync_read(buf);
-                    // 如果读到EOF,说明对面关闭了连接
-                    if(len == 0) {
-                        fmt::println("CONNECTION SHUT DOWN<{}>", connid);
-                        goto quit;
-                    }
-                    req_parser.push_chunk(buf.subspan(0, len));
-                } while (!req_parser.request_finished());
-            
-                fmt::println("recv req head: {}", req_parser.header_raw());
-                fmt::println("recv req body: {}", req_parser.body());
-                std::string body = req_parser.body();
+    address_resolver::socket_address_storage addr;
+    int connfd = CHECK_CALL(accept, listenfd, &addr.addr, &addr.addrlen);
+    fmt::println("NEW CONNECTION <{}>", connfd);
+    // 这里用new是因为有回调，因此分配在栈上的话会自动销毁，到时候回调就找不到对象执行了
+    auto conn_handler = new http_connection_handler{};
+    conn_handler->do_init(connfd);
 
-                http_response_writer res_writer;
-                res_writer.begin_header(200);
-                res_writer.write_header("Server", "c17_http");
-                res_writer.write_header("Connection", "keep-alive");
-                res_writer.write_header("Content-length", std::to_string(body.size()));
-                res_writer.end_header();
-                auto& buffer = res_writer.buffer();
-                conn.sync_write(buffer);
-                conn.sync_write(body);
-
-                fmt::println("send res head: {}", std::string(buffer));
-                fmt::println("send res body: {}", body);
-            }
-            // res_writer.write_body(body);
-        quit:
-            fmt::println("CONNECTION CLOSE <{}>", connid);
-            close(connid);
-        });
+    // 轮询查看是否有新的任务未处理
+    while(!to_be_called_later.empty()) {
+        auto task = std::move(to_be_called_later.front());
+        to_be_called_later.pop_front();
+        task();
     }
+    fmt::println("all tasks done.");
+
 }
 
 
@@ -731,8 +845,5 @@ int main() {
         fmt::println("Error: {}", e.what());
     }
     
-    for(auto& t : pool) {
-        t.join();
-    }
     return 0;
 }
