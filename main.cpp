@@ -682,7 +682,7 @@ struct callback {
     explicit operator bool() const noexcept {
         return base_ != nullptr;
     }
-
+    
 };
 
 template <class HeaderWriter = http11_header_writer>
