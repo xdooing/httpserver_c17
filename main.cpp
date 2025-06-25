@@ -622,6 +622,7 @@ struct _http_base_writer {
     }
 };
 
+// TODO: 万能引用 完美转发 引用折叠
 template <class... Args>
 struct callback {
     struct _callback_base{
@@ -682,7 +683,7 @@ struct callback {
     explicit operator bool() const noexcept {
         return base_ != nullptr;
     }
-    
+
 };
 
 template <class HeaderWriter = http11_header_writer>
@@ -736,7 +737,6 @@ struct async_file {
                 async_read(buf, std::move(cb));
             });
         }
-        // time: 1:54:42
     }
 
     ssize_t sync_write(bytes_view buf) {
