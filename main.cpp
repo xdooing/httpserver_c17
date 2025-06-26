@@ -64,6 +64,7 @@ template <int Except = 0, class T>
 T check_error(const char* what, T res) {
     if(res == -1) {
         if constexpr (Except != 0) {
+            // printf("errno = %d\n", errno);
             if(errno == Except) {
                 return -1;
             }
@@ -121,6 +122,7 @@ struct address_resolver {
             socket_address_fatptr addr = get_address();
             // bind
             CHECK_CALL(bind, socketfd, addr.addr, addr.addrlen);
+            CHECK_CALL(listen, socketfd, SOMAXCONN);
             return socketfd;
         }
     };
@@ -670,16 +672,18 @@ struct callback {
         return static_cast<void *>(base_.get());
     }
 
+    // 返回裸指针（raw pointer），并将 unique_ptr 内部的指针置为 nullptr。
+    // 调用后，unique_ptr 不再管理该对象，​不会自动释放内存，因此需要我们手动释放这个函数的返回值
     void* leak_address() noexcept {
         return static_cast<void *>(base_.release());
     }
 
-    // static callback from_address(void *addr) noexcept {
-    //     callback cb;
-    //     cb.m_base = std::unique_ptr<_callback_base>(
-    //         static_cast<_callback_base *>(addr));
-    //     return cb;
-    // }
+    static callback from_address(void *addr) noexcept {
+        callback cb;
+        cb.base_ = std::unique_ptr<_callback_base>(
+            static_cast<_callback_base *>(addr));
+        return cb;
+    }
 
     explicit operator bool() const noexcept {
         return base_ != nullptr;
@@ -701,14 +705,18 @@ struct http_response_writer : _http_base_writer<HeaderWriter> {
     }
 };
 
+// // for debug
+// int check_call_execpt(int fd, address_resolver::socket_address_storage& addr) {
+//     int ret = accept(fd, &addr.addr, &addr.addrlen);
+//     return check_error<EAGAIN>("Test", ret);
+// }
+
 // epoll
 int epollfd;
-// 异步
-std::deque<callback<>> to_be_called_later;
 
 struct async_file {
     int fd_;
-
+    
     static async_file async_wrap(int fd) {
         int flags = CHECK_CALL(fcntl, fd, F_GETFL);
         // 将文件描述符设置为非阻塞
@@ -717,7 +725,7 @@ struct async_file {
 
         // create epoll
         struct epoll_event event;
-        event.events = EPOLLIN | EPOLLET;
+        event.events = EPOLLET;
         epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
 
         return async_file{fd};
@@ -738,14 +746,22 @@ struct async_file {
         if(ret != -1) {
             cb(ret);
             return;
-        }else {
-            // cb = std::move(cb) 表示移动捕获，表示将cb的所有权转移到lambda函数内
-            // 外部的cb会变的无效，也就是移出状态，这被视为一种修改，因此这里需要是用 mutable
-            // 当需要在 lambda 内修改按值捕获的变量时，必须使用 mutable
-            to_be_called_later.push_back([this, buf, cb = std::move(cb)] () mutable {
-                async_read(buf, std::move(cb));
-            });
         }
+        
+        /*如果可以read了，系统会通知我调用这个函数*/
+        // cb = std::move(cb) 表示移动捕获，表示将cb的所有权转移到lambda函数内
+        // 外部的cb会变的无效，也就是移出状态，这被视为一种修改，因此这里需要是用 mutable
+        // 当需要在 lambda 内修改按值捕获的变量时，必须使用 mutable
+        callback<> resume = [this, buf, cb = std::move(cb)] () mutable {
+            async_read(buf, std::move(cb));
+        };
+
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+        // 将cb func存下来，当系统通知有事件触发时，就可以调用callback函数
+        // 其实这里也可以将this指针存下来，到时候也能调用callback
+        event.data.ptr = resume.leak_address();
+        epoll_ctl(epollfd, EPOLL_CTL_MOD, fd_, &event);
     }
 
     ssize_t sync_write(bytes_view buf) {
@@ -754,6 +770,30 @@ struct async_file {
 
     void async_write(bytes_view buf, callback<ssize_t> cb) {
         cb(CHECK_CALL(write, fd_, buf.data(), buf.size()));
+    }
+
+    int sync_accept(address_resolver::socket_address_storage& addr) {
+        return CHECK_CALL(accept, fd_, &addr.addr, &addr.addrlen);
+    }
+
+    void async_accept(address_resolver::socket_address_storage& addr, callback<int> cb) {
+        // fmt::println("run into async_accept");
+        ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN, accept, fd_, &addr.addr, &addr.addrlen);
+        // fmt::println("ret = {}", ret);
+        if(ret != -1) {
+            cb(ret);
+            return;
+        }
+        
+        /*如果可以 accept 了，系统会通知我调用这个函数*/
+        callback<> resume = [this, &addr, cb = std::move(cb)] () mutable {
+            async_accept(addr, std::move(cb));
+        };
+
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+        event.data.ptr = resume.leak_address();
+        epoll_ctl(epollfd, EPOLL_CTL_MOD, fd_, &event);
     }
 
     void close_file() {
@@ -769,14 +809,14 @@ struct http_connection_handler {
     // 所以其他局部变量可以直接 http_request_parser req_parser_;
     http_request_parser<> req_parser_;
 
-    void do_init(int connfd) {
+    void do_start(int connfd) {
         conn_ = async_file::async_wrap(connfd);
         // 初始化的时候就开始read，因为是非阻塞的，暂时读不到数据的话会延迟调用callback函数的
         do_read();
     }
 
     void do_read() {
-        fmt::println("begin read...");
+        // fmt::println("begin read...");
         // 这里的ssize_t n 看似是参数，实际上可以理解为回调函数的返回值
         conn_.async_read(buf_, [this](ssize_t n){
             if(n == 0) {
@@ -821,32 +861,51 @@ struct http_connection_handler {
     }
 };
 
+struct http_connection_acceptor {
+    async_file listen_;
+    address_resolver::socket_address_storage addr_;
+
+    void do_start(std::string ip, std::string port) {
+        fmt::println("Listening {}:{}", ip, port);
+        address_resolver resolver;
+        auto entry = resolver.resolve(ip, port);
+        int listenfd = entry.create_socket_and_bind();
+        fmt::println("Listen fd <{}>", listenfd);
+
+        listen_ = async_file::async_wrap(listenfd);
+
+        do_accept();
+    }
+
+    void do_accept() {
+        listen_.async_accept(addr_, [this](int connfd) {
+            fmt::println("NEW CONNECTION <{}>", connfd);
+
+            auto conn_handler = new http_connection_handler();
+            conn_handler->do_start(connfd);
+
+            do_accept();
+        }); 
+    }
+};
+
 void server(std::string ip, std::string port) {
-
-    fmt::println("Listening {}:{}", ip, port);
-    
-    address_resolver resolver;
-    auto entry = resolver.resolve(ip, port);
-    int listenfd = entry.create_socket_and_bind();
-    CHECK_CALL(listen, listenfd, SOMAXCONN);
-
-    //accept
-    address_resolver::socket_address_storage addr;
-    int connfd = CHECK_CALL(accept, listenfd, &addr.addr, &addr.addrlen);
-    fmt::println("NEW CONNECTION <{}>", connfd);
-
     // epoll fd
     epollfd = epoll_create1(0);
-    
-    // 这里用new是因为有回调，因此分配在栈上的话会自动销毁，到时候回调就找不到对象执行了
-    auto conn_handler = new http_connection_handler{};
-    conn_handler->do_init(connfd);
 
-    // 轮询查看是否有新的任务未处理
-    while(!to_be_called_later.empty()) {
-        auto task = std::move(to_be_called_later.front());
-        to_be_called_later.pop_front();
-        task();
+    auto acceptor = new http_connection_acceptor();
+    acceptor->do_start(ip, port);
+  
+    // 轮询等待
+    struct epoll_event events[10];
+    while(true) {
+        int ret = epoll_wait(epollfd, events, 10, -1);
+        if(ret < 0)
+            throw;
+        for(int i = 0; i < ret; ++i) {
+            auto cb = callback<>::from_address(events[i].data.ptr);
+            cb();
+        }
     }
     fmt::println("all tasks done.");
     close(epollfd);
