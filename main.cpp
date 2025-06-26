@@ -16,6 +16,7 @@
 #include <functional>
 #include <type_traits>
 #include <deque>
+#include <sys/epoll.h>
 
 void debug_msg(const char* msg) {
     return;
@@ -700,7 +701,8 @@ struct http_response_writer : _http_base_writer<HeaderWriter> {
     }
 };
 
-
+// epoll
+int epollfd;
 // 异步
 std::deque<callback<>> to_be_called_later;
 
@@ -712,6 +714,12 @@ struct async_file {
         // 将文件描述符设置为非阻塞
         flags |= O_NONBLOCK;
         CHECK_CALL(fcntl, fd, F_SETFL, flags);
+
+        // create epoll
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET;
+        epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
+
         return async_file{fd};
     }
     // 阻塞read
@@ -729,6 +737,7 @@ struct async_file {
         ssize_t ret = CHECK_CALL_EXCEPT(EAGAIN, read, fd_, buf.data(), buf.size());
         if(ret != -1) {
             cb(ret);
+            return;
         }else {
             // cb = std::move(cb) 表示移动捕获，表示将cb的所有权转移到lambda函数内
             // 外部的cb会变的无效，也就是移出状态，这被视为一种修改，因此这里需要是用 mutable
@@ -745,6 +754,11 @@ struct async_file {
 
     void async_write(bytes_view buf, callback<ssize_t> cb) {
         cb(CHECK_CALL(write, fd_, buf.data(), buf.size()));
+    }
+
+    void close_file() {
+        epoll_ctl(epollfd, EPOLL_CTL_DEL, fd_, NULL);
+        close(fd_);
     }
 };
 
@@ -802,7 +816,7 @@ struct http_connection_handler {
     }
 
     void do_close() {
-        close(conn_.fd_);
+        conn_.close_file();
         delete this;
     }
 };
@@ -820,6 +834,10 @@ void server(std::string ip, std::string port) {
     address_resolver::socket_address_storage addr;
     int connfd = CHECK_CALL(accept, listenfd, &addr.addr, &addr.addrlen);
     fmt::println("NEW CONNECTION <{}>", connfd);
+
+    // epoll fd
+    epollfd = epoll_create1(0);
+    
     // 这里用new是因为有回调，因此分配在栈上的话会自动销毁，到时候回调就找不到对象执行了
     auto conn_handler = new http_connection_handler{};
     conn_handler->do_init(connfd);
@@ -831,6 +849,7 @@ void server(std::string ip, std::string port) {
         task();
     }
     fmt::println("all tasks done.");
+    close(epollfd);
 
 }
 
